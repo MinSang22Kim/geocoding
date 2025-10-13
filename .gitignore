@@ -1,4 +1,7 @@
 .env
 .venv
-output
 *.log
+
+input
+output
+
