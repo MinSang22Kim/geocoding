@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 import re
+import shutil
 
 # 로깅 설정
 logging.basicConfig(
@@ -54,17 +55,12 @@ class VWorldGeocoder:
         
         # 4. 오타 교정 및 행정구역명 수정
         corrections = {
-            # 오타 교정
             "홍덕구": "흥덕구",
             "원롱면": "월롱면",
             "원삭로": "원당로",
             "송백로로": "송백로",
-            
-            # 행정구역 변경 (면 → 읍)
             "달성군 현풍면": "달성군 현풍읍",
             "예천군 호명면": "예천군 호명읍",
-            
-            # 도로명 변환 (신설 → 기존)
             "현풍동로": "현풍중앙로",
             "현풍서로": "현풍중앙로",
             "도청대로": "충효로",
@@ -85,54 +81,40 @@ class VWorldGeocoder:
         return addr
 
     def extract_address_candidates(self, address: str) -> list:
-        """다양한 레벨의 주소 후보를 생성 (공격적)"""
+        """다양한 레벨의 주소 후보를 생성"""
         candidates = []
-        
-        # Level 1: 원본 주소
         candidates.append(address)
         
-        # Level 2: 건물번호 제거
         no_number = re.sub(r'\s+\d+(-\d+)?(\s|$)', ' ', address).strip()
         if no_number != address and len(no_number) > 5:
             candidates.append(no_number)
         
-        # Level 3: 길/로/대로까지만 (도로명만)
         road_match = re.match(r'(.+?[시도군구]\s+.+?[읍면동]?\s*.+?[로길대로가])\s*', address)
         if road_match:
             road_only = road_match.group(1).strip()
             if road_only not in candidates and len(road_only) > 5:
                 candidates.append(road_only)
         
-        # Level 4: 읍면동까지만
         dong_match = re.match(r'(.+?[시도군구]\s+.+?[읍면동리])', address)
         if dong_match:
             dong_only = dong_match.group(1).strip()
             if dong_only not in candidates and len(dong_only) > 5:
                 candidates.append(dong_only)
         
-        # Level 5: 시군구까지만 (마지막 수단)
-        sigungu_match = re.match(r'(.+?[시군구])', address)
-        if sigungu_match:
-            sigungu_only = sigungu_match.group(1).strip()
-            if sigungu_only not in candidates and len(sigungu_only) > 3:
-                candidates.append(sigungu_only)
-        
         return candidates
 
     def geocode_address(self, address: str, jibun_address: str = None) -> Tuple[Optional[float], Optional[float], str]:
-        """주소를 좌표로 변환 (다단계 폴백)"""
+        """주소를 좌표로 변환"""
         if self.today_count >= self.daily_limit:
             return None, None, 'limit_reached'
 
         addresses_to_try = []
         
-        # 도로명 주소 처리
         if address and not pd.isna(address):
             cleaned = self.clean_address(address)
             if cleaned and len(cleaned) > 3:
                 addresses_to_try.append((cleaned, 'road', '도로명'))
         
-        # 지번 주소 처리
         if jibun_address and not pd.isna(jibun_address):
             cleaned_jibun = self.clean_address(jibun_address)
             if cleaned_jibun and len(cleaned_jibun) > 3:
@@ -141,38 +123,21 @@ class VWorldGeocoder:
         if not addresses_to_try:
             return None, None, 'empty'
 
-        # 각 주소 타입별로 다단계 시도
         for addr, addr_type, type_name in addresses_to_try:
             candidates = self.extract_address_candidates(addr)
             
             for i, candidate in enumerate(candidates):
-                if len(candidate) < 3:  # 너무 짧은 주소는 스킵
+                if len(candidate) < 3:
                     continue
-                    
                 lat, lon, status = self._try_geocode(candidate, addr_type)
                 if status == 'success':
-                    level_names = ['정확주소', '도로명', '도로기준', '읍면동', '시군구']
+                    level_names = ['정확주소', '도로명', '도로기준', '읍면동']
                     level = level_names[i] if i < len(level_names) else '광역'
                     logging.info(f"✅ 성공 [{level}·{type_name}]: {candidate[:40]} → ({lat:.6f}, {lon:.6f})")
                     return lat, lon, status
-                
-                # API 호출 간 짧은 대기
                 time.sleep(0.08)
 
-        # 모든 시도 실패
-        reason = self._analyze_failure(addresses_to_try[0][0])
-        short_addr = addresses_to_try[0][0][:50]
-        logging.warning(f"❌ 실패 [{reason}]: {short_addr}")
         return None, None, 'failed'
-
-    def _analyze_failure(self, address: str) -> str:
-        """실패 원인 분석"""
-        if re.search(r'\d{4,}', address):
-            return "큰번지"
-        elif len(address.split()) < 2:
-            return "정보부족"
-        else:
-            return "미등록"
 
     def _try_geocode(self, address: str, addr_type: str = 'road') -> Tuple[Optional[float], Optional[float], str]:
         """VWorld API 요청"""
@@ -206,42 +171,69 @@ class VWorldGeocoder:
 
             return None, None, 'failed'
 
-        except requests.exceptions.Timeout:
-            return None, None, 'failed'
-        except requests.exceptions.RequestException:
-            return None, None, 'failed'
-        except Exception as e:
-            logging.error(f"API 오류: {str(e)}")
+        except:
             return None, None, 'failed'
 
 
 def load_progress(progress_file: Path) -> Optional[pd.DataFrame]:
+    """진행 파일 로드"""
     if progress_file.exists():
         try:
             logging.info(f"📂 이전 진행 상황 로드: {progress_file}")
             return pd.read_csv(progress_file, encoding='utf-8-sig', low_memory=False)
         except Exception as e:
-            logging.warning(f"진행 파일 읽기 실패: {e}")
+            logging.warning(f"⚠️ 진행 파일 읽기 실패: {e}")
     return None
 
 
-def save_progress(df: pd.DataFrame, progress_file: Path):
-    df.to_csv(progress_file, index=False, encoding='utf-8-sig')
-    logging.info(f"💾 저장 완료")
+def save_progress_safe(df: pd.DataFrame, progress_file: Path):
+    """안전한 저장 (원자적 저장)"""
+    try:
+        # 임시 파일에 먼저 저장
+        temp_file = Path(str(progress_file) + '.tmp')
+        df.to_csv(temp_file, index=False, encoding='utf-8-sig')
+        
+        # 기존 파일 백업
+        if progress_file.exists():
+            backup_file = Path(str(progress_file) + '.backup')
+            shutil.copy2(progress_file, backup_file)
+        
+        # 임시 파일을 실제 파일로 이동
+        shutil.move(str(temp_file), str(progress_file))
+        
+        logging.info(f"💾 저장 완료")
+        
+    except Exception as e:
+        logging.error(f"❌ 저장 실패: {e}")
+        raise
 
 
-def get_batch_number(output_dir: Path) -> int:
-    existing_files = list(output_dir.glob("batch_*.csv"))
-    if not existing_files:
-        return 1
-    batch_numbers = []
-    for f in existing_files:
-        try:
-            num = int(f.stem.split('_')[1])
-            batch_numbers.append(num)
-        except:
-            continue
-    return max(batch_numbers) + 1 if batch_numbers else 1
+def save_daily_backup(df: pd.DataFrame, output_dir: Path, today_str: str):
+    """오늘 처리한 데이터만 별도 저장 (날짜별 백업)"""
+    try:
+        # 오늘 처리된 데이터만 필터링
+        today_processed = df[
+            df['처리일시'].notna() & 
+            df['처리일시'].str.startswith(today_str)
+        ].copy()
+        
+        if len(today_processed) == 0:
+            logging.warning("⚠️ 오늘 처리된 데이터가 없습니다.")
+            return
+        
+        # 날짜별 파일명 생성 (예: daily_20251023.csv)
+        today_file = today_str.replace('-', '')
+        daily_file = output_dir / f"daily_{today_file}.csv"
+        
+        # 저장
+        today_processed.to_csv(daily_file, index=False, encoding='utf-8-sig')
+        
+        success_count = (today_processed['처리상태'] == 'success').sum()
+        logging.info(f"📅 오늘 백업 저장: {daily_file.name}")
+        logging.info(f"   총 {len(today_processed):,}건 (성공: {success_count:,}건)")
+        
+    except Exception as e:
+        logging.error(f"❌ 일일 백업 저장 실패: {e}")
 
 
 def print_progress_stats(df: pd.DataFrame):
@@ -279,20 +271,22 @@ def main():
     DAILY_LIMIT = 40000
 
     OUTPUT_DIR.mkdir(exist_ok=True)
-    today_str = datetime.now().strftime('%Y%m%d')
+
+    today_str = datetime.now().strftime('%Y-%m-%d')
 
     logging.info("=" * 70)
-    logging.info(f"🚀 브이월드 지오코딩 시작")
+    logging.info(f"🚀 브이월드 지오코딩 (안전 모드 + 일일 백업)")
     logging.info(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info("=" * 70)
 
+    # 진행 파일 로드 또는 새로 생성
     progress_df = load_progress(PROGRESS_FILE)
     if progress_df is not None:
         df = progress_df
         logging.info(f"✅ 이전 데이터 로드 완료")
         print_progress_stats(df)
     else:
-        logging.info(f"📂 파일 읽기: {INPUT_FILE}")
+        logging.info(f"📂 원본 파일 읽기: {INPUT_FILE}")
         df = pd.read_csv(INPUT_FILE, encoding='utf-8-sig')
         df['위도'] = None
         df['경도'] = None
@@ -301,7 +295,6 @@ def main():
         logging.info(f"✅ {len(df):,}건 로드 (신규)")
         logging.info("=" * 70)
 
-    batch_num = get_batch_number(OUTPUT_DIR)
     geocoder = VWorldGeocoder(API_KEY, DAILY_LIMIT)
 
     success_count = 0
@@ -311,15 +304,16 @@ def main():
 
     try:
         for idx in df.index:
+            # 이미 성공한 건은 스킵
             if df.at[idx, '처리상태'] == 'success':
                 skip_count += 1
                 continue
 
+            # 일일 한도 체크
             if geocoder.today_count >= DAILY_LIMIT:
                 logging.warning("=" * 70)
                 logging.warning(f"⚠️  일일 한도 도달 ({DAILY_LIMIT:,}건)")
                 logging.warning("=" * 70)
-                save_progress(df, PROGRESS_FILE)
                 break
 
             road_address = df.at[idx, '주소'] if '주소' in df.columns else None
@@ -342,9 +336,8 @@ def main():
                 rate = (success_count / geocoder.today_count * 100) if geocoder.today_count > 0 else 0
                 elapsed = time.time() - start_time
                 speed = geocoder.today_count / elapsed if elapsed > 0 else 0
-                remaining_requests = DAILY_LIMIT - geocoder.today_count
-                eta_sec = remaining_requests / speed if speed > 0 else 0
-                eta_min = int(eta_sec / 60)
+                remaining = DAILY_LIMIT - geocoder.today_count
+                eta_min = int((remaining / speed / 60)) if speed > 0 else 0
                 
                 logging.info(f"📊 {geocoder.today_count:>5,}건 | "
                              f"성공: {success_count:>4,} ({rate:>4.1f}%) | "
@@ -354,27 +347,32 @@ def main():
 
             # 1000건마다 중간 저장
             if geocoder.today_count % 1000 == 0:
-                save_progress(df, PROGRESS_FILE)
+                save_progress_safe(df, PROGRESS_FILE)
 
-            # 적절한 딜레이
             time.sleep(0.12)
 
-        save_progress(df, PROGRESS_FILE)
+        # 최종 저장
+        save_progress_safe(df, PROGRESS_FILE)
+        
+        # 오늘 처리한 데이터를 날짜별 백업으로 저장
+        if geocoder.today_count > 0:
+            save_daily_backup(df, OUTPUT_DIR, today_str)
 
     except KeyboardInterrupt:
         logging.warning("\n⚠️  중단됨. 저장 중...")
-        save_progress(df, PROGRESS_FILE)
+        save_progress_safe(df, PROGRESS_FILE)
+        if geocoder.today_count > 0:
+            save_daily_backup(df, OUTPUT_DIR, today_str)
         logging.warning("✅ 저장 완료")
         return
+    except Exception as e:
+        logging.error(f"\n❌ 오류 발생: {e}")
+        save_progress_safe(df, PROGRESS_FILE)
+        if geocoder.today_count > 0:
+            save_daily_backup(df, OUTPUT_DIR, today_str)
+        raise
 
-    # 오늘 처리 결과 저장
-    if geocoder.today_count > 0:
-        batch_output = OUTPUT_DIR / f"batch_{batch_num:02d}_{today_str}.csv"
-        today_processed = df[df['처리일시'].notna() & df['처리일시'].str.startswith(today_str[:10])]
-        if len(today_processed) > 0:
-            today_processed.to_csv(batch_output, index=False, encoding='utf-8-sig')
-            logging.info(f"\n💾 배치 저장: {batch_output.name} ({len(today_processed):,}건)")
-
+    # 통계 출력
     elapsed_time = time.time() - start_time
     avg_speed = geocoder.today_count / elapsed_time if elapsed_time > 0 else 0
 
