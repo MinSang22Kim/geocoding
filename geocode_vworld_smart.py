@@ -8,6 +8,45 @@ from datetime import datetime, timedelta
 import re
 import shutil
 
+"""
+════════════════════════════════════════════════════════════════════════════════
+⭐⭐⭐ 설정 변경 필요시 아래 CONFIG 섹션만 수정하세요! ⭐⭐⭐
+════════════════════════════════════════════════════════════════════════════════
+"""
+
+# ============================================================================
+# ⚙️ CONFIG - 여기만 수정하세요!
+# ============================================================================
+
+# 🔑 API 키 설정 (계정 바꿀 때마다 여기만 수정!)
+API_KEY = "CBDA8338-FEF2-34AE-9B04-D31B3597153F"  # ⭐ 여기 수정
+# API_KEY = "01C14AE8-F90A-312A-92A2-395337FDB8AF"
+
+# 📅 날짜 설정 (자동 vs 수동)
+USE_AUTO_DATE = False  # True: 오늘 날짜 자동, False: 아래 날짜 사용
+MANUAL_DATE = "2025-10-30"  # USE_AUTO_DATE가 False일 때 사용
+
+# 📊 하루 한도
+DAILY_LIMIT = 80000  # API 하루 한도
+
+# 📂 파일 경로
+INPUT_FILE = "input/charger_v2.csv"
+OUTPUT_DIR = "output"
+
+# ============================================================================
+# ⚙️ CONFIG 끝 - 아래는 수정 금지!
+# ============================================================================
+
+"""
+════════════════════════════════════════════════════════════════════════════════
+이 코드의 특징:
+1. ✅ pending만 처리 (success, failed는 건너뜀)
+2. ✅ daily CSV 파일을 안전하게 누적 저장 (덮어쓰기 방지)
+3. ✅ API 키 바뀌면 처음부터 다시 시작 가능
+4. ✅ 4만 건마다 별도 파일 생성 가능
+════════════════════════════════════════════════════════════════════════════════
+"""
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -155,10 +194,8 @@ def check_today_usage(df: pd.DataFrame, today_str: str) -> int:
     if '처리일시' not in df.columns:
         return 0
 
-    # NaN → 빈 문자열, 그리고 모든 값 문자열로 변환
     df['처리일시'] = df['처리일시'].fillna("").astype(str)
 
-    # 혹시 '처리일시'가 datetime 타입으로 저장되어 있는 경우 대비
     if pd.api.types.is_datetime64_any_dtype(df['처리일시']):
         mask = df['처리일시'].dt.strftime("%Y-%m-%d").eq(today_str)
     else:
@@ -171,6 +208,7 @@ def analyze_situation(df: pd.DataFrame, today_str: str):
     """현재 상황 분석 및 안내"""
     total = len(df)
     success = (df['처리상태'] == 'success').sum()
+    failed = (df['처리상태'] == 'failed').sum()
     pending = (df['처리상태'] == 'pending').sum()
     today_processed = check_today_usage(df, today_str)
     
@@ -179,6 +217,7 @@ def analyze_situation(df: pd.DataFrame, today_str: str):
     logging.info("=" * 70)
     logging.info(f"전체:          {total:>10,}건")
     logging.info(f"✅ 완료:       {success:>10,}건 ({success/total*100:>5.1f}%)")
+    logging.info(f"❌ 실패:       {failed:>10,}건 ({failed/total*100:>5.1f}%)")
     logging.info(f"⏳ 대기:       {pending:>10,}건 ({pending/total*100:>5.1f}%)")
     logging.info(f"📅 오늘 처리:  {today_processed:>10,}건")
     logging.info("=" * 70)
@@ -207,7 +246,9 @@ def analyze_situation(df: pd.DataFrame, today_str: str):
         logging.info(f"   한도: 40,000건")
     
     if pending == 0:
-        logging.info("\n🎉 모든 데이터 처리 완료!")
+        logging.info("\n🎉 모든 대기 중인 데이터 처리 완료!")
+        if failed > 0:
+            logging.info(f"💡 실패한 {failed:,}건은 다시 시도하지 않습니다.")
         return False
     
     return True
@@ -235,61 +276,112 @@ def save_progress_safe(df: pd.DataFrame, progress_file: Path):
             shutil.copy2(progress_file, backup_file)
         
         shutil.move(str(temp_file), str(progress_file))
-        logging.info(f"💾 저장 완료")
+        logging.info(f"💾 progress.csv 저장 완료")
     except Exception as e:
         logging.error(f"❌ 저장 실패: {e}")
         raise
 
 
-def save_daily_backup(df: pd.DataFrame, output_dir: Path, today_str: str):
-    """오늘 처리한 데이터만 별도 저장"""
+def save_daily_backup_safe(df: pd.DataFrame, output_dir: Path, today_str: str):
+    """
+    오늘 처리한 데이터를 안전하게 누적 저장
+    - 기존 파일이 있으면 이어붙임 (덮어쓰기 방지)
+    - 여러 번 실행해도 안전
+    """
     try:
+        # 오늘 처리한 데이터 필터링
+        df['처리일시'] = df['처리일시'].fillna("").astype(str)
+        
         today_processed = df[
-            df['처리일시'].notna() & 
             df['처리일시'].str.startswith(today_str)
         ].copy()
         
         if len(today_processed) == 0:
+            logging.warning(f"⚠️ 오늘({today_str}) 처리된 데이터가 없습니다.")
             return
         
+        # 파일명 생성
         today_file = today_str.replace('-', '')
         daily_file = output_dir / f"daily_{today_file}.csv"
         
-        # 이미 오늘 백업이 있으면 병합
+        # 기존 파일이 있는지 확인
         if daily_file.exists():
-            df_existing = pd.read_csv(daily_file, encoding='utf-8-sig')
-            # 인덱스 기준으로 업데이트
+            logging.info(f"📂 기존 daily 파일 발견: {daily_file.name}")
+            
+            # 기존 파일 읽기
+            existing_df = pd.read_csv(daily_file, encoding='utf-8-sig', low_memory=False)
+            existing_count = len(existing_df)
+            
+            # 새로운 데이터와 병합 (중복 제거)
+            # 인덱스 기준으로 최신 데이터로 업데이트
+            combined = existing_df.set_index(existing_df.index)
             for idx in today_processed.index:
-                if idx < len(df_existing):
-                    df_existing.iloc[idx] = today_processed.iloc[0]  # 덮어쓰기
-            today_processed = df_existing
-        
-        today_processed.to_csv(daily_file, index=False, encoding='utf-8-sig')
-        
-        success_count = (today_processed['처리상태'] == 'success').sum()
-        logging.info(f"📅 일일 백업: {daily_file.name} ({success_count:,}건 성공)")
+                if idx < len(combined):
+                    combined.iloc[idx] = today_processed.loc[idx]
+                else:
+                    # 새로운 인덱스면 추가
+                    combined = pd.concat([combined, today_processed.loc[[idx]]])
+            
+            combined.reset_index(drop=True, inplace=True)
+            
+            # 저장
+            combined.to_csv(daily_file, index=False, encoding='utf-8-sig')
+            
+            new_count = len(combined)
+            added_count = new_count - existing_count
+            
+            logging.info("=" * 70)
+            logging.info(f"📅 일일 백업 업데이트 완료!")
+            logging.info(f"   파일: {daily_file.name}")
+            logging.info(f"   기존: {existing_count:,}건 → 현재: {new_count:,}건 (+{added_count:,}건)")
+            
+            success_count = (combined['처리상태'] == 'success').sum()
+            failed_count = (combined['처리상태'] == 'failed').sum()
+            logging.info(f"   성공: {success_count:,}건, 실패: {failed_count:,}건")
+            logging.info("=" * 70)
+            
+        else:
+            # 새 파일 생성
+            today_processed.to_csv(daily_file, index=False, encoding='utf-8-sig')
+            
+            success_count = (today_processed['처리상태'] == 'success').sum()
+            failed_count = (today_processed['처리상태'] == 'failed').sum()
+            
+            logging.info("=" * 70)
+            logging.info(f"📅 일일 백업 생성 완료!")
+            logging.info(f"   파일: {daily_file.name}")
+            logging.info(f"   총 {len(today_processed):,}건 (성공: {success_count:,}, 실패: {failed_count:,})")
+            logging.info("=" * 70)
         
     except Exception as e:
         logging.error(f"❌ 일일 백업 실패: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
 
 
 def main():
-    API_KEY = "01C14AE8-F90A-312A-92A2-395337FDB8AF"
-    INPUT_FILE = "input/charger_v2.csv"
-    OUTPUT_DIR = Path("output")
-    PROGRESS_FILE = OUTPUT_DIR / "progress.csv"
-    DAILY_LIMIT = 40000
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    today_str = datetime.now().strftime('%Y-%m-%d')
-
+    # CONFIG에서 설정 가져오기
+    output_dir = Path(OUTPUT_DIR)
+    progress_file = output_dir / "progress.csv"
+    
+    output_dir.mkdir(exist_ok=True)
+    
+    # 날짜 설정
+    if USE_AUTO_DATE:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        logging.info(f"🕒 today_str 계산값: {today_str}")
+    else:
+        today_str = MANUAL_DATE
+    
     logging.info("=" * 70)
     logging.info(f"🚀 지오코딩 자동 실행")
-    logging.info(f"   📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"   📅 현재 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"   🗓️  처리 날짜: {today_str}")
+    logging.info(f"   🔑 API 키: {API_KEY[:10]}...{API_KEY[-10:]}")
     logging.info("=" * 70)
 
     # 진행 파일 로드 또는 새로 생성
-    progress_df = load_progress(PROGRESS_FILE)
+    progress_df = load_progress(progress_file)
     if progress_df is not None:
         df = progress_df
     else:
@@ -320,12 +412,17 @@ def main():
     skip_count = 0
     start_time = time.time()
 
-    try:
-        for idx in df.index:
-            if df.at[idx, '처리상태'] == 'success':
-                skip_count += 1
-                continue
+    # ⭐⭐⭐ 핵심: pending 상태만 처리 (success와 failed는 건너뜀) ⭐⭐⭐
+    pending_indices = df[df['처리상태'] == 'pending'].index
+    total_success = (df['처리상태'] == 'success').sum()
+    total_failed = (df['처리상태'] == 'failed').sum()
+    
+    logging.info(f"📝 처리 대상: {len(pending_indices):,}건 (pending만)")
+    logging.info(f"🔄 건너뜀: {total_success + total_failed:,}건 (완료 {total_success:,} + 실패 {total_failed:,})\n")
 
+    try:
+        for idx in pending_indices:
+            # 한도 체크
             if geocoder.today_count >= remaining_limit:
                 logging.warning("=" * 70)
                 logging.warning(f"⚠️  오늘 한도 도달!")
@@ -361,20 +458,25 @@ def main():
                              f"남은시간: {eta_min}분")
 
             if geocoder.today_count % 1000 == 0:
-                save_progress_safe(df, PROGRESS_FILE)
+                save_progress_safe(df, progress_file)
 
             time.sleep(0.12)
 
-        save_progress_safe(df, PROGRESS_FILE)
+        # ⭐ 최종 저장
+        save_progress_safe(df, progress_file)
         
+        # ⭐⭐⭐ 반드시 daily 백업 저장 (안전한 누적 방식) ⭐⭐⭐
         if geocoder.today_count > 0:
-            save_daily_backup(df, OUTPUT_DIR, today_str)
+            logging.info("\n💾 일일 백업 파일 저장 중...")
+            save_daily_backup_safe(df, output_dir, today_str)
+        else:
+            logging.warning("\n⚠️ 오늘 처리한 데이터가 없어 daily 파일을 생성하지 않습니다.")
 
     except KeyboardInterrupt:
         logging.warning("\n⚠️  중단됨. 저장 중...")
-        save_progress_safe(df, PROGRESS_FILE)
+        save_progress_safe(df, progress_file)
         if geocoder.today_count > 0:
-            save_daily_backup(df, OUTPUT_DIR, today_str)
+            save_daily_backup_safe(df, output_dir, today_str)
         return
 
     # 최종 통계
@@ -392,17 +494,19 @@ def main():
     
     total = len(df)
     total_success = (df['처리상태'] == 'success').sum()
+    total_failed = (df['처리상태'] == 'failed').sum()
     total_pending = (df['처리상태'] == 'pending').sum()
     
     logging.info("-" * 70)
     logging.info(f"전체 진행률:   {total_success/total*100:>5.1f}% ({total_success:,}/{total:,}건)")
+    logging.info(f"실패:          {total_failed:>10,}건 (재시도 안 함)")
     logging.info(f"남은 작업:     {total_pending:>10,}건")
     
     if total_pending > 0:
         est_days = (total_pending + 39999) // 40000
         logging.info(f"예상 소요:     약 {est_days}일")
-        logging.info("\n💡 내일 같은 명령어로 이어서 진행하세요!")
-        logging.info("   → py geocode_vworld_smart.py")
+        logging.info("\n💡 같은 명령어로 이어서 진행하세요!")
+        logging.info("   → py geocode_vworld_smart_v2.py")
     else:
         logging.info("\n🎉 전체 완료!")
     
@@ -410,3 +514,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
